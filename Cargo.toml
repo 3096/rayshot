@@ -1,0 +1,12 @@
+[package]
+name = "rayshot"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+chrono = "0.4.41"
+eframe = "0.31.1"
+global-hotkey = "0.7.0"
+image = "0.25.6"
+xcap = "0.6.2"
+tokio = { version = "1.0", features = ["full"] }
