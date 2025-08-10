@@ -28,44 +28,65 @@ struct ScreenshotState {
     pub moving: bool,
 }
 
+#[derive(Clone)]
 struct ScreenshotEntry {
     pub image: Option<std::sync::Arc<image::RgbaImage>>,
-    pub filename: String,
-    pub file_location: FileLocation,
+    pub filename: std::sync::Arc<String>,
+    pub file_location: std::sync::Arc<tokio::sync::Mutex<FileLocation>>,
     pub file_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
-    pub state: ScreenshotState,
+    pub state: std::sync::Arc<tokio::sync::Mutex<ScreenshotState>>,
 }
 
 impl ScreenshotEntry {
     pub fn new(filename: String, file_location: FileLocation) -> Self {
         Self {
             image: None,
-            filename,
-            file_location,
+            filename: std::sync::Arc::new(filename),
+            file_location: std::sync::Arc::new(tokio::sync::Mutex::new(file_location)),
             file_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-            state: ScreenshotState {
+            state: std::sync::Arc::new(tokio::sync::Mutex::new(ScreenshotState {
                 writing: false,
                 moving: false,
-            },
+            })),
         }
     }
 
     pub fn new_with_image(
-        image: image::RgbaImage,
+        image: std::sync::Arc<image::RgbaImage>,
         filename: String,
         file_location: FileLocation,
     ) -> Self {
         Self {
-            image: Some(std::sync::Arc::new(image)),
-            filename,
-            file_location,
+            image: Some(image),
+            filename: std::sync::Arc::new(filename),
+            file_location: std::sync::Arc::new(tokio::sync::Mutex::new(file_location)),
             file_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-            state: ScreenshotState {
+            state: std::sync::Arc::new(tokio::sync::Mutex::new(ScreenshotState {
                 writing: false,
                 moving: false,
-            },
+            })),
         }
     }
+}
+
+#[derive(Clone)]
+struct RayshotState {
+    pub screenshot_entries: std::sync::Arc<tokio::sync::Mutex<Vec<ScreenshotEntry>>>,
+    pub error_messages: std::sync::Arc<tokio::sync::Mutex<Vec<String>>>,
+}
+
+impl RayshotState {
+    pub fn new() -> Self {
+        Self {
+            screenshot_entries: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            error_messages: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum RayshotHotkey {
+    CaptureScreenshot,
 }
 
 #[tokio::main]
@@ -82,9 +103,8 @@ async fn main() {
     global_hotkey_manager.register(capture_hotkey).unwrap();
     let global_hotkey_receiver = global_hotkey::GlobalHotKeyEvent::receiver();
 
-    let screenshot_entries: std::sync::Arc<tokio::sync::Mutex<Vec<ScreenshotEntry>>> =
-        std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
-    let screenshot_entries_gui = screenshot_entries.clone();
+    let rayshot_state = RayshotState::new();
+    let rayshot_state_gui = rayshot_state.clone();
 
     let (hotkey_tx, mut hotkey_rx) = tokio::sync::mpsc::unbounded_channel::<RayshotHotkey>();
     std::thread::spawn(move || loop {
@@ -119,6 +139,8 @@ async fn main() {
                     match hotkey {
                         RayshotHotkey::CaptureScreenshot => {
                             println!("Hotkey event detected: {:?}", hotkey);
+                            let rayshot_state = rayshot_state.clone();
+                            let egui_ctx = egui_ctx.clone();
                             tokio::task::spawn_blocking(move || {
                                 let window_title = "原神";
                                 let screenshot_file_name = format!(
@@ -126,47 +148,66 @@ async fn main() {
                                     window_title.replace(" ", "_"),
                                     chrono::Local::now().format("%Y%m%d_%H%M%S.%f")
                                 );
-                                match take_window_screenshot(window_title) {
-                                    Ok(image_buffer) => {
-                                        print!("Captured screenshot: {}", screenshot_file_name);
-                                        if let Err(e) = image_buffer.save(&screenshot_file_name) {
-                                            eprintln!("Error saving screenshot: {}", e);
-                                        } else {
-                                            println!(
-                                                "Screenshot saved as: {}",
-                                                screenshot_file_name
-                                            );
-                                        }
-                                    }
-                                    Err(e) => {
-                                        eprintln!("Error capturing screenshot: {}", e);
-                                    }
+                                let Ok(image_buffer) = take_window_screenshot(window_title) else {
+                                    let err_str = format!(
+                                        "Failed to capture screenshot for window '{}'",
+                                        window_title
+                                    );
+                                    eprintln!("{}", err_str);
+                                    rayshot_state.error_messages.blocking_lock().push(err_str);
+                                    egui_ctx.request_repaint();
+                                    return;
+                                };
+                                let image_buffer = std::sync::Arc::new(image_buffer);
+
+                                let screenshot_entry = ScreenshotEntry::new_with_image(
+                                    image_buffer.clone(),
+                                    screenshot_file_name,
+                                    FileLocation::Local,
+                                );
+
+                                screenshot_entry.state.blocking_lock().writing = true;
+                                {
+                                    let _file_lock = screenshot_entry.file_lock.blocking_lock();
+                                    rayshot_state
+                                        .screenshot_entries
+                                        .blocking_lock()
+                                        .push(screenshot_entry.clone());
+                                    egui_ctx.request_repaint();
+
+                                    image_buffer
+                                        .save(screenshot_entry.filename.as_str())
+                                        .unwrap_or_else(|e| {
+                                            let err_str =
+                                                format!("Failed to save screenshot: {}", e);
+                                            eprintln!("{}", err_str);
+                                            rayshot_state
+                                                .error_messages
+                                                .blocking_lock()
+                                                .push(err_str);
+                                        });
                                 }
+                                screenshot_entry.state.blocking_lock().writing = false;
+                                egui_ctx.request_repaint();
                             });
-                            egui_ctx.request_repaint();
                         }
                     }
                 }
             });
 
-            Ok(Box::new(RayshotApp::new(screenshot_entries_gui)))
+            Ok(Box::new(RayshotApp::new(rayshot_state_gui)))
         }),
     )
     .unwrap();
 }
 
-#[derive(Debug, Clone)]
-enum RayshotHotkey {
-    CaptureScreenshot,
-}
-
 struct RayshotApp {
-    screenshot_entries: std::sync::Arc<tokio::sync::Mutex<Vec<ScreenshotEntry>>>,
+    rayshot_state: RayshotState,
 }
 
 impl RayshotApp {
-    fn new(screenshot_entries: std::sync::Arc<tokio::sync::Mutex<Vec<ScreenshotEntry>>>) -> Self {
-        Self { screenshot_entries }
+    fn new(rayshot_state: RayshotState) -> Self {
+        Self { rayshot_state }
     }
 }
 
