@@ -1,4 +1,6 @@
 const TARGET_WINDOW_TITLE: &str = "原神";
+const SCREENSHOT_DIR_PATH: &str = "screenshots";
+const TRASH_DIR_PATH: &str = "trashed";
 
 fn take_window_screenshot(window_title: &str) -> xcap::XCapResult<image::RgbaImage> {
     let window_title_lower = window_title.to_lowercase();
@@ -67,6 +69,7 @@ impl ScreenshotEntry {
 #[derive(Clone)]
 struct RayshotState {
     pub screenshot_entries: std::sync::Arc<tokio::sync::Mutex<Vec<ScreenshotEntry>>>,
+    pub cur_screenshot_idx: std::sync::Arc<tokio::sync::Mutex<usize>>,
     pub error_messages: std::sync::Arc<tokio::sync::Mutex<Vec<String>>>,
 }
 
@@ -74,28 +77,127 @@ impl RayshotState {
     pub fn new() -> Self {
         Self {
             screenshot_entries: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            cur_screenshot_idx: std::sync::Arc::new(tokio::sync::Mutex::new(0)),
             error_messages: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
         }
     }
+
+    pub async fn try_increment_screenshot_index(&self) -> usize {
+        let mut idx = self.cur_screenshot_idx.lock().await;
+        *idx += 1;
+        {
+            let entries = self.screenshot_entries.lock().await;
+            if *idx >= entries.len() {
+                *idx = entries.len() - 1;
+            }
+        }
+        *idx
+    }
+
+    pub async fn try_decrement_screenshot_index(&self) -> usize {
+        let mut idx = self.cur_screenshot_idx.lock().await;
+        if *idx > 0 {
+            *idx -= 1;
+        }
+        *idx
+    }
+
+    pub async fn get_current_screenshot(&self) -> Option<ScreenshotEntry> {
+        let idx = *self.cur_screenshot_idx.lock().await;
+        let entries = self.screenshot_entries.lock().await;
+        entries.get(idx).cloned()
+    }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
 enum RayshotHotkey {
     CaptureScreenshot,
+    Left,
+    Right,
+    Trash,
+}
+
+async fn report_error(
+    rayshot_state: &RayshotState,
+    egui_ctx: &eframe::egui::Context,
+    error_msg: String,
+) {
+    eprintln!("{}", error_msg);
+    rayshot_state.error_messages.lock().await.push(error_msg);
+    egui_ctx.request_repaint();
 }
 
 #[tokio::main]
 async fn main() {
-    let capture_hotkey = global_hotkey::hotkey::HotKey::new(
-        Some(global_hotkey::hotkey::Modifiers::CONTROL | global_hotkey::hotkey::Modifiers::SHIFT),
-        global_hotkey::hotkey::Code::KeyP,
-    );
+    // Ensure required directories exist
+    let screenshot_dir = std::path::Path::new(SCREENSHOT_DIR_PATH);
+    let trash_dir = std::path::Path::new(TRASH_DIR_PATH);
 
-    let mut hotkey_map = std::collections::HashMap::new();
-    hotkey_map.insert(capture_hotkey.id(), RayshotHotkey::CaptureScreenshot);
+    if !screenshot_dir.exists() {
+        if let Err(e) = std::fs::create_dir_all(screenshot_dir) {
+            eprintln!(
+                "Failed to create screenshot directory '{}': {}",
+                SCREENSHOT_DIR_PATH, e
+            );
+            std::process::exit(1);
+        }
+        println!("Created screenshot directory: {}", SCREENSHOT_DIR_PATH);
+    }
+
+    if !trash_dir.exists() {
+        if let Err(e) = std::fs::create_dir_all(trash_dir) {
+            eprintln!(
+                "Failed to create trash directory '{}': {}",
+                TRASH_DIR_PATH, e
+            );
+            std::process::exit(1);
+        }
+        println!("Created trash directory: {}", TRASH_DIR_PATH);
+    }
+
+    let hotkey_definitions = std::collections::HashMap::from([
+        (
+            RayshotHotkey::CaptureScreenshot,
+            (
+                Some(
+                    global_hotkey::hotkey::Modifiers::CONTROL
+                        | global_hotkey::hotkey::Modifiers::SHIFT,
+                ),
+                global_hotkey::hotkey::Code::KeyP,
+            ),
+        ),
+        (
+            RayshotHotkey::Left,
+            (None, global_hotkey::hotkey::Code::ArrowLeft),
+        ),
+        (
+            RayshotHotkey::Right,
+            (None, global_hotkey::hotkey::Code::ArrowRight),
+        ),
+        (
+            RayshotHotkey::Trash,
+            (None, global_hotkey::hotkey::Code::Delete),
+        ),
+    ]);
+
+    let hotkeys: Vec<_> = hotkey_definitions
+        .iter()
+        .map(|(rayshot_hotkey, (modifiers, code))| {
+            let hotkey = global_hotkey::hotkey::HotKey::new(*modifiers, *code);
+            (hotkey, rayshot_hotkey.clone())
+        })
+        .collect();
 
     let global_hotkey_manager = global_hotkey::GlobalHotKeyManager::new().unwrap();
-    global_hotkey_manager.register(capture_hotkey).unwrap();
+    for (hotkey, _) in &hotkeys {
+        global_hotkey_manager.register(*hotkey).unwrap();
+    }
+
+    let hotkey_map: std::collections::HashMap<_, _> = hotkeys
+        .into_iter()
+        .map(|(hotkey, rayshot_hotkey)| (hotkey.id(), rayshot_hotkey))
+        .collect();
+
     let global_hotkey_receiver = global_hotkey::GlobalHotKeyEvent::receiver();
 
     let rayshot_state = RayshotState::new();
@@ -131,6 +233,8 @@ async fn main() {
                         continue;
                     };
 
+                    let rayshot_state = rayshot_state.clone();
+                    let egui_ctx = egui_ctx.clone();
                     match hotkey {
                         RayshotHotkey::CaptureScreenshot => {
                             println!("Hotkey event detected: {:?}", hotkey);
@@ -140,8 +244,6 @@ async fn main() {
                                 take_window_screenshot(TARGET_WINDOW_TITLE)
                             });
 
-                            let rayshot_state = rayshot_state.clone();
-                            let egui_ctx = egui_ctx.clone();
                             tokio::task::spawn(async move {
                                 // prepare the screenshot entry to signal the UI we have a new screenshot
                                 let screenshot_file_name = std::sync::Arc::new(format!(
@@ -154,18 +256,17 @@ async fn main() {
                                     FileLocation::Local,
                                 );
                                 screenshot_entry.state.lock().await.capturing = true;
-                                rayshot_state
-                                    .screenshot_entries
-                                    .lock()
-                                    .await
-                                    .push(screenshot_entry.clone());
+                                let screenshot_entry_idx;
+                                {
+                                    let mut entries = rayshot_state.screenshot_entries.lock().await;
+                                    screenshot_entry_idx = entries.len();
+                                    entries.push(screenshot_entry.clone());
+                                }
                                 egui_ctx.request_repaint();
 
                                 let handle_error = |error_msg: String| async {
-                                    eprintln!("{}", error_msg);
-                                    rayshot_state.error_messages.lock().await.push(error_msg);
                                     screenshot_entry.state.lock().await.failed = true;
-                                    egui_ctx.request_repaint();
+                                    report_error(&rayshot_state, &egui_ctx, error_msg).await;
                                 };
 
                                 // receive the screenshot
@@ -206,6 +307,8 @@ async fn main() {
                                         .texture_handle
                                         .blocking_lock()
                                         .replace(texture_handle);
+                                    *rayshot_state.cur_screenshot_idx.blocking_lock() =
+                                        screenshot_entry_idx;
                                     {
                                         let mut screenshot_state =
                                             screenshot_entry.state.blocking_lock();
@@ -214,8 +317,12 @@ async fn main() {
                                     }
                                     {
                                         let _file_lock = screenshot_entry.file_lock.blocking_lock();
+                                        egui_ctx.request_repaint();
                                         image_buffer
-                                            .save(screenshot_entry.filename.as_str())
+                                            .save(
+                                                std::path::Path::new(SCREENSHOT_DIR_PATH)
+                                                    .join(screenshot_file_name.as_str()),
+                                            )
                                             .unwrap_or_else(|e| {
                                                 let err_str =
                                                     format!("Failed to save screenshot: {}", e);
@@ -231,6 +338,70 @@ async fn main() {
                                     screenshot_entry.state.blocking_lock().writing = false;
                                     egui_ctx.request_repaint();
                                 });
+                            });
+                        }
+                        RayshotHotkey::Left => {
+                            tokio::task::spawn(async move {
+                                rayshot_state.try_decrement_screenshot_index().await;
+                                egui_ctx.request_repaint();
+                            });
+                        }
+                        RayshotHotkey::Right => {
+                            tokio::task::spawn(async move {
+                                rayshot_state.try_increment_screenshot_index().await;
+                                egui_ctx.request_repaint();
+                            });
+                        }
+                        RayshotHotkey::Trash => {
+                            tokio::task::spawn(async move {
+                                let Some(current_entry) =
+                                    rayshot_state.get_current_screenshot().await
+                                else {
+                                    return report_error(
+                                        &rayshot_state,
+                                        &egui_ctx,
+                                        "No current screenshot to move to trash".to_string(),
+                                    )
+                                    .await;
+                                };
+
+                                current_entry.state.lock().await.moving = true;
+                                {
+                                    let _file_lock = current_entry.file_lock.lock().await;
+                                    egui_ctx.request_repaint();
+                                    let (current_dir, target_location, target_dir) =
+                                        match *current_entry.file_location.lock().await {
+                                            FileLocation::Local => (
+                                                SCREENSHOT_DIR_PATH,
+                                                FileLocation::Trash,
+                                                TRASH_DIR_PATH,
+                                            ),
+                                            FileLocation::Trash => (
+                                                TRASH_DIR_PATH,
+                                                FileLocation::Local,
+                                                SCREENSHOT_DIR_PATH,
+                                            ),
+                                        };
+                                    let target_path = std::path::Path::new(target_dir)
+                                        .join(current_entry.filename.as_str());
+                                    let current_path = std::path::Path::new(current_dir)
+                                        .join(current_entry.filename.as_str());
+                                    if let Err(e) = std::fs::rename(&current_path, &target_path) {
+                                        current_entry.state.lock().await.failed = true;
+                                        return report_error(
+                                            &rayshot_state,
+                                            &egui_ctx,
+                                            format!(
+                                                "Failed to move screenshot '{}' to '{}': {}",
+                                                current_entry.filename, target_dir, e
+                                            ),
+                                        )
+                                        .await;
+                                    }
+                                    *current_entry.file_location.lock().await = target_location;
+                                }
+                                current_entry.state.lock().await.moving = false;
+                                egui_ctx.request_repaint();
                             });
                         }
                     }
