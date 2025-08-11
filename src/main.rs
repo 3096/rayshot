@@ -1,3 +1,5 @@
+const TARGET_WINDOW_TITLE: &str = "原神";
+
 fn take_window_screenshot(window_title: &str) -> xcap::XCapResult<image::RgbaImage> {
     let window_title_lower = window_title.to_lowercase();
     let all_windows = xcap::Window::all()?;
@@ -24,13 +26,26 @@ enum FileLocation {
 }
 
 struct ScreenshotState {
+    pub capturing: bool,
     pub writing: bool,
     pub moving: bool,
+    pub failed: bool,
+}
+
+impl ScreenshotState {
+    pub fn new() -> Self {
+        Self {
+            capturing: false,
+            writing: false,
+            moving: false,
+            failed: false,
+        }
+    }
 }
 
 #[derive(Clone)]
 struct ScreenshotEntry {
-    pub image: Option<std::sync::Arc<image::RgbaImage>>,
+    pub texture_handle: std::sync::Arc<tokio::sync::Mutex<Option<eframe::epaint::TextureHandle>>>,
     pub filename: std::sync::Arc<String>,
     pub file_location: std::sync::Arc<tokio::sync::Mutex<FileLocation>>,
     pub file_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
@@ -38,33 +53,13 @@ struct ScreenshotEntry {
 }
 
 impl ScreenshotEntry {
-    pub fn new(filename: String, file_location: FileLocation) -> Self {
+    pub fn new(filename: std::sync::Arc<String>, file_location: FileLocation) -> Self {
         Self {
-            image: None,
-            filename: std::sync::Arc::new(filename),
+            texture_handle: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            filename,
             file_location: std::sync::Arc::new(tokio::sync::Mutex::new(file_location)),
             file_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-            state: std::sync::Arc::new(tokio::sync::Mutex::new(ScreenshotState {
-                writing: false,
-                moving: false,
-            })),
-        }
-    }
-
-    pub fn new_with_image(
-        image: std::sync::Arc<image::RgbaImage>,
-        filename: String,
-        file_location: FileLocation,
-    ) -> Self {
-        Self {
-            image: Some(image),
-            filename: std::sync::Arc::new(filename),
-            file_location: std::sync::Arc::new(tokio::sync::Mutex::new(file_location)),
-            file_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-            state: std::sync::Arc::new(tokio::sync::Mutex::new(ScreenshotState {
-                writing: false,
-                moving: false,
-            })),
+            state: std::sync::Arc::new(tokio::sync::Mutex::new(ScreenshotState::new())),
         }
     }
 }
@@ -139,56 +134,103 @@ async fn main() {
                     match hotkey {
                         RayshotHotkey::CaptureScreenshot => {
                             println!("Hotkey event detected: {:?}", hotkey);
+
+                            // immediately capture the screenshot
+                            let screenshot_task = tokio::task::spawn_blocking(|| {
+                                take_window_screenshot(TARGET_WINDOW_TITLE)
+                            });
+
                             let rayshot_state = rayshot_state.clone();
                             let egui_ctx = egui_ctx.clone();
-                            tokio::task::spawn_blocking(move || {
-                                let window_title = "原神";
-                                let screenshot_file_name = format!(
+                            tokio::task::spawn(async move {
+                                // prepare the screenshot entry to signal the UI we have a new screenshot
+                                let screenshot_file_name = std::sync::Arc::new(format!(
                                     "{}_{}.png",
-                                    window_title.replace(" ", "_"),
+                                    TARGET_WINDOW_TITLE,
                                     chrono::Local::now().format("%Y%m%d_%H%M%S.%f")
-                                );
-                                let Ok(image_buffer) = take_window_screenshot(window_title) else {
-                                    let err_str = format!(
-                                        "Failed to capture screenshot for window '{}'",
-                                        window_title
-                                    );
-                                    eprintln!("{}", err_str);
-                                    rayshot_state.error_messages.blocking_lock().push(err_str);
-                                    egui_ctx.request_repaint();
-                                    return;
-                                };
-                                let image_buffer = std::sync::Arc::new(image_buffer);
-
-                                let screenshot_entry = ScreenshotEntry::new_with_image(
-                                    image_buffer.clone(),
-                                    screenshot_file_name,
+                                ));
+                                let screenshot_entry = ScreenshotEntry::new(
+                                    screenshot_file_name.clone(),
                                     FileLocation::Local,
                                 );
-
-                                screenshot_entry.state.blocking_lock().writing = true;
-                                {
-                                    let _file_lock = screenshot_entry.file_lock.blocking_lock();
-                                    rayshot_state
-                                        .screenshot_entries
-                                        .blocking_lock()
-                                        .push(screenshot_entry.clone());
-                                    egui_ctx.request_repaint();
-
-                                    image_buffer
-                                        .save(screenshot_entry.filename.as_str())
-                                        .unwrap_or_else(|e| {
-                                            let err_str =
-                                                format!("Failed to save screenshot: {}", e);
-                                            eprintln!("{}", err_str);
-                                            rayshot_state
-                                                .error_messages
-                                                .blocking_lock()
-                                                .push(err_str);
-                                        });
-                                }
-                                screenshot_entry.state.blocking_lock().writing = false;
+                                screenshot_entry.state.lock().await.capturing = true;
+                                rayshot_state
+                                    .screenshot_entries
+                                    .lock()
+                                    .await
+                                    .push(screenshot_entry.clone());
                                 egui_ctx.request_repaint();
+
+                                let handle_error = |error_msg: String| async {
+                                    eprintln!("{}", error_msg);
+                                    rayshot_state.error_messages.lock().await.push(error_msg);
+                                    screenshot_entry.state.lock().await.failed = true;
+                                    egui_ctx.request_repaint();
+                                };
+
+                                // receive the screenshot
+                                let image_buffer = match screenshot_task.await {
+                                    Ok(Ok(buffer)) => buffer,
+                                    Ok(Err(error)) => {
+                                        handle_error(format!(
+                                            "Failed to capture screenshot for window '{}': {}",
+                                            TARGET_WINDOW_TITLE, error
+                                        ))
+                                        .await;
+                                        return;
+                                    }
+                                    Err(error) => {
+                                        handle_error(format!(
+                                            "Task failed for window '{}': {}",
+                                            TARGET_WINDOW_TITLE, error
+                                        ))
+                                        .await;
+                                        return;
+                                    }
+                                };
+
+                                // write the screenshot to gpu for UI display, then to file
+                                tokio::task::spawn_blocking(move || {
+                                    let texture_handle = egui_ctx.load_texture(
+                                        screenshot_file_name.as_str(),
+                                        eframe::epaint::ColorImage::from_rgba_unmultiplied(
+                                            [
+                                                image_buffer.width() as usize,
+                                                image_buffer.height() as usize,
+                                            ],
+                                            image_buffer.as_raw(),
+                                        ),
+                                        Default::default(),
+                                    );
+                                    screenshot_entry
+                                        .texture_handle
+                                        .blocking_lock()
+                                        .replace(texture_handle);
+                                    {
+                                        let mut screenshot_state =
+                                            screenshot_entry.state.blocking_lock();
+                                        screenshot_state.capturing = false;
+                                        screenshot_state.writing = true;
+                                    }
+                                    {
+                                        let _file_lock = screenshot_entry.file_lock.blocking_lock();
+                                        image_buffer
+                                            .save(screenshot_entry.filename.as_str())
+                                            .unwrap_or_else(|e| {
+                                                let err_str =
+                                                    format!("Failed to save screenshot: {}", e);
+                                                eprintln!("{}", err_str);
+                                                rayshot_state
+                                                    .error_messages
+                                                    .blocking_lock()
+                                                    .push(err_str);
+                                                screenshot_entry.state.blocking_lock().failed =
+                                                    true;
+                                            });
+                                    }
+                                    screenshot_entry.state.blocking_lock().writing = false;
+                                    egui_ctx.request_repaint();
+                                });
                             });
                         }
                     }
